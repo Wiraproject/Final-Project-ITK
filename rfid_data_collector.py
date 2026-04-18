@@ -1,49 +1,56 @@
 """
 Program Pengambilan Data RSSI UHF-RFID
-Penelitian: SVR-LANDMARC Adaptif
+Penelitian: SVR-LANDMARC Adaptif — Wiranto (NIM 11221030)
 Reader   : EL-UHF-RC4-2 (Electron Indonesia)
 Protokol : Binary frame, HEAD=0xCF, 115200 8N1
 
-Format RSSI (dokumentasi resmi electron.id):
-  - RSSI = 2 Bytes, two's complement, unit = 0.1 dBm
-  - Contoh: 0xFE48 = -440 (raw) = -44.0 dBm
+CARA KERJA YANG BENAR:
+  - Semua tag referensi (R1, R2, dst) diambil BERSAMAAN dalam 1 sesi
+  - Reader scan semua tag, data dipisah otomatis berdasarkan EPC
+  - Hasil disimpan ke 1 file Excel dengan sheet terpisah per tag
 
-Cara pakai:
-  python rfid_data_collector.py
-
-Library yang dibutuhkan:
-  pip install pyserial openpyxl
+SEBELUM MENJALANKAN:
+  1. pip install pyserial openpyxl
+  2. Ubah PORT di bawah sesuai port COM kamu
+  3. Daftarkan EPC setiap tag di bagian KONFIGURASI TAG
 """
 
 import serial
 import time
-import openpyxl
 from openpyxl import Workbook
 from datetime import datetime
 
-# ─────────────────────────────────────────────
-#  KONFIGURASI — SESUAIKAN DI SINI
-# ─────────────────────────────────────────────
-PORT           = "COM11"    # Ganti dengan port COM kamu (mis. COM4, COM5)
+# ══════════════════════════════════════════════════════
+#  KONFIGURASI UTAMA — SESUAIKAN SEBELUM DIJALANKAN
+# ══════════════════════════════════════════════════════
+
+PORT           = "COM11"   # Port COM reader kamu, mis. COM4, COM5
 BAUDRATE       = 115200
-TARGET_SAMPLES = 100       # Jumlah sampel per sesi
-READER_ADDR    = 0x00      # Alamat default reader
+TARGET_SAMPLES = 500      # Jumlah sampel per tag
 
-# ─────────────────────────────────────────────
-#  KONSTANTA PROTOKOL EL-UHF-RC4
-# ─────────────────────────────────────────────
+# Daftarkan EPC dan jarak tiap tag di sini.
+# EPC bisa dilihat dari output diagnostik (mode 2).
+# Jalankan mode diagnostik dulu untuk mendapatkan EPC setiap tag.
+#
+# Format: "NAMA_TAG": {"epc": "XX XX XX ...", "jarak_cm": angka}
+TAG_CONFIG = {
+    "R1": {"epc": "E2 80 69 95 00 00 50 17 60 37 C0 F7", "jarak_cm": 100},
+    "R2": {"epc": "E2 80 69 95 00 00 40 17 60 37 A8 F7", "jarak_cm": 300},
+    # Untuk Skenario 2 (3 tag referensi), tambahkan R3:
+    # "R3": {"epc": "XX XX XX XX XX XX XX XX XX XX XX XX", "jarak_cm": 200},
+}
+
+# ══════════════════════════════════════════════════════
+#  PROTOKOL EL-UHF-RC4
+# ══════════════════════════════════════════════════════
+
 HEADER = 0xCF
-CMD_INVENTORY_STOP = bytearray([0x00, 0x02])
-CMD_INIT           = bytearray([0x00, 0x50])
-
-# Frame inventory start lengkap dari dokumentasi resmi
-# CF FF 00 01 05 00 00 00 00 00 F5 B5
+READER_ADDR = 0x00
 FRAME_INVENTORY_START = bytes.fromhex("CFFF0001050000000000F5B5")
+CMD_INVENTORY_STOP    = bytearray([0x00, 0x02])
+CMD_INIT              = bytearray([0x00, 0x50])
 
 
-# ─────────────────────────────────────────────
-#  CRC16 DAN FRAME BUILDER
-# ─────────────────────────────────────────────
 def calculate_crc16(data: bytes) -> bytearray:
     value = 0xFFFF
     for d in data:
@@ -62,39 +69,17 @@ def build_command(cmd: bytearray, param: bytearray = bytearray()) -> bytes:
     return bytes(frame)
 
 
-# ─────────────────────────────────────────────
-#  KONVERSI RSSI (PERBAIKAN UTAMA)
-# ─────────────────────────────────────────────
 def parse_rssi(byte_high: int, byte_low: int) -> float:
-    """
-    Konversi 2 byte RSSI ke dBm.
-
-    Format dari dokumentasi resmi EL-UHF-RC4:
-      - 2 bytes, two's complement signed 16-bit
-      - Unit: 0.1 dBm
-      - Contoh: 0xFE48 = -440 = -44.0 dBm
-
-    Sebelumnya program membaca 1 byte signed → menghasilkan nilai -3 (salah).
-    Sekarang membaca 2 byte signed → akan menghasilkan nilai sekitar -44 dBm (benar).
-    """
-    raw_uint16 = (byte_high << 8) | byte_low
-    # Konversi two's complement ke signed
-    raw_signed = raw_uint16 - 0x10000 if raw_uint16 >= 0x8000 else raw_uint16
-    return raw_signed / 10.0
+    """2-byte two's complement, unit 0.1 dBm → dBm float."""
+    raw = (byte_high << 8) | byte_low
+    signed = raw - 0x10000 if raw >= 0x8000 else raw
+    return signed / 10.0
 
 
-# ─────────────────────────────────────────────
-#  PARSER RESPONSE FRAME
-# ─────────────────────────────────────────────
 def parse_inventory_response(data: bytes) -> list:
     """
-    Parsing semua inventory response frame dari buffer serial.
-
-    Format response (CMD=0x0001, STATUS=0x00):
-      HEAD | ADDR | CMD(2) | LEN | STATUS | InventoryParam | CRC(2)
-
-    InventoryParam:
-      RSSI(2) | Antenna(1) | Channel(1) | TagInfoLen(1) | TagInfo(N bytes)
+    Parse semua inventory response frame dari buffer.
+    Return: list of {'epc': str, 'rssi_dbm': float}
     """
     tags = []
     i = 0
@@ -102,13 +87,12 @@ def parse_inventory_response(data: bytes) -> list:
         if data[i] != 0xCF:
             i += 1
             continue
-
         if i + 6 >= len(data):
             break
 
         cmd_word = (data[i+2] << 8) | data[i+3]
         length   = data[i+4]
-        total    = 5 + length + 2  # header(5) + payload(length) + crc(2)
+        total    = 5 + length + 2
 
         if i + total > len(data):
             break
@@ -121,26 +105,22 @@ def parse_inventory_response(data: bytes) -> list:
             tag_info_len = param[4]
             tag_info     = param[5 : 5 + tag_info_len]
             epc_hex      = ' '.join(f'{b:02X}' for b in tag_info)
-
-            tags.append({
-                'epc'      : epc_hex,
-                'rssi_dbm' : rssi_dbm,
-                'rssi_raw' : f"0x{param[0]:02X}{param[1]:02X}",
-            })
+            if epc_hex:
+                tags.append({'epc': epc_hex, 'rssi_dbm': rssi_dbm})
 
         i += total
-
     return tags
 
 
-# ─────────────────────────────────────────────
-#  KELAS RFID COLLECTOR
-# ─────────────────────────────────────────────
-class RFIDCollector:
+# ══════════════════════════════════════════════════════
+#  KELAS READER
+# ══════════════════════════════════════════════════════
+
+class RFIDReader:
     def __init__(self, port, baudrate=115200):
-        self.port     = port
+        self.ser = None
+        self.port = port
         self.baudrate = baudrate
-        self.ser      = None
 
     def connect(self) -> bool:
         try:
@@ -151,205 +131,280 @@ class RFIDCollector:
             )
             time.sleep(0.5)
             self.ser.flushInput()
-            print(f"[OK] Terhubung ke reader di {self.port}")
+            print(f"[OK] Terhubung ke {self.port}")
             return True
         except serial.SerialException as e:
-            print(f"[ERROR] Gagal membuka {self.port}: {e}")
+            print(f"[ERROR] {e}")
             return False
 
-    def init_reader(self):
+    def init(self):
         self.ser.write(build_command(CMD_INIT))
         time.sleep(0.3)
-        resp = self.ser.read(self.ser.in_waiting or 10)
-        if resp and len(resp) >= 6 and resp[0] == 0xCF:
-            print(f"[OK] Reader diinisialisasi. Status byte: 0x{resp[5]:02X}")
-        else:
-            print("[INFO] Tidak ada respons inisialisasi.")
         self.ser.flushInput()
+        print("[OK] Reader diinisialisasi.")
 
-    def start_inventory(self):
+    def start(self):
         self.ser.write(FRAME_INVENTORY_START)
         time.sleep(0.05)
 
-    def stop_inventory(self):
+    def stop(self):
         self.ser.write(build_command(CMD_INVENTORY_STOP))
         time.sleep(0.2)
         self.ser.flushInput()
 
-    def read_buffer(self, timeout_sec=0.4) -> bytes:
-        buf   = bytearray()
-        start = time.time()
-        while (time.time() - start) < timeout_sec:
+    def read_buffer(self, timeout=0.3) -> bytes:
+        buf = bytearray()
+        t0  = time.time()
+        while (time.time() - t0) < timeout:
             n = self.ser.in_waiting
             if n:
                 buf.extend(self.ser.read(n))
             else:
-                time.sleep(0.01)
+                time.sleep(0.005)
         return bytes(buf)
 
     def disconnect(self):
         if self.ser and self.ser.is_open:
             try:
-                self.stop_inventory()
+                self.stop()
             except Exception:
                 pass
             self.ser.close()
             print("[OK] Koneksi ditutup.")
 
 
-# ─────────────────────────────────────────────
-#  MODE DIAGNOSTIK
-# ─────────────────────────────────────────────
-def run_diagnostic(collector: RFIDCollector):
+# ══════════════════════════════════════════════════════
+#  MODE DIAGNOSTIK — scan EPC semua tag yang terbaca
+# ══════════════════════════════════════════════════════
+
+def run_diagnostic(reader: RFIDReader):
     """
-    Tampilkan raw bytes dan hasil parsing RSSI secara real-time.
-    Gunakan ini untuk memverifikasi nilai RSSI sudah benar sebelum
-    melakukan pengambilan data sesungguhnya.
+    Gunakan ini PERTAMA KALI untuk mengetahui EPC setiap tag.
+    Taruh tag satu per satu di depan reader, catat EPC-nya,
+    lalu isi TAG_CONFIG di bagian atas script.
     """
-    print("\n" + "="*55)
-    print("  MODE DIAGNOSTIK")
-    print("  Dekatkan tag ke reader. Tekan Ctrl+C untuk keluar.")
-    print("  RSSI yang wajar pada jarak 1m: sekitar -40 s/d -55 dBm")
-    print("="*55 + "\n")
-    collector.start_inventory()
+    print("\n" + "="*60)
+    print("  MODE DIAGNOSTIK — Scan EPC & Cek Nilai RSSI")
+    print("  Taruh tag di depan reader.")
+    print("  RSSI normal 1m: -40 s/d -55 dBm")
+    print("  RSSI normal 3m: -65 s/d -80 dBm")
+    print("  Tekan Ctrl+C untuk keluar.")
+    print("="*60 + "\n")
+
+    seen_epcs = {}
+    reader.start()
     try:
         while True:
-            raw  = collector.read_buffer(1.0)
+            raw  = reader.read_buffer(1.0)
             tags = parse_inventory_response(raw)
-            if tags:
-                for t in tags:
-                    print(f"  EPC: {t['epc']:30s} | "
-                          f"RSSI raw: {t['rssi_raw']} | "
-                          f"RSSI: {t['rssi_dbm']:7.1f} dBm")
-            elif raw:
-                hex_str = ' '.join(f'{b:02X}' for b in raw[:30])
-                print(f"  [raw tidak terparsing] {hex_str}...")
+            for t in tags:
+                epc  = t['epc']
+                rssi = t['rssi_dbm']
+                if epc not in seen_epcs:
+                    seen_epcs[epc] = []
+                seen_epcs[epc].append(rssi)
+                avg = sum(seen_epcs[epc]) / len(seen_epcs[epc])
+                print(f"  EPC: {epc}  |  RSSI: {rssi:6.1f} dBm  (avg: {avg:.1f})")
     except KeyboardInterrupt:
-        print("\n[INFO] Diagnostik dihentikan.")
+        print("\n\n[INFO] EPC yang terdeteksi:")
+        for epc, rvals in seen_epcs.items():
+            avg = sum(rvals) / len(rvals)
+            print(f"  {epc}  →  avg RSSI: {avg:.1f} dBm  ({len(rvals)} bacaan)")
+        print("\nSalin EPC di atas ke TAG_CONFIG di bagian atas script.")
     finally:
-        collector.stop_inventory()
+        reader.stop()
 
 
-# ─────────────────────────────────────────────
-#  PENGAMBILAN SAMPEL
-# ─────────────────────────────────────────────
-def collect_samples(collector, n_samples, label, jarak_cm, kondisi, skenario):
-    records    = []
-    target_epc = None
+# ══════════════════════════════════════════════════════
+#  PENGAMBILAN DATA UTAMA — semua tag bersamaan
+# ══════════════════════════════════════════════════════
 
-    print(f"\n{'='*55}")
-    print(f"  Tag: {label}  |  Jarak: {jarak_cm} cm")
-    print(f"  Kondisi: {kondisi}  |  Skenario: {skenario}")
-    print(f"  Target: {n_samples} sampel")
-    print(f"{'='*55}")
-    input("  Pastikan tag sudah di posisi yang benar, lalu tekan ENTER...\n")
+def collect_all_tags(reader: RFIDReader, tag_config: dict,
+                     kondisi: str, skenario: str) -> dict:
+    """
+    Kumpulkan TARGET_SAMPLES sampel untuk SETIAP tag secara bersamaan.
+    Reader scan terus, setiap bacaan dicocokkan ke EPC yang terdaftar.
 
-    collector.start_inventory()
+    Return: dict {"R1": [records], "R2": [records], ...}
+    """
+    # Inisialisasi tempat penyimpanan data per tag
+    records = {name: [] for name in tag_config}
+    # Buat lookup: EPC string → nama tag
+    epc_to_name = {cfg['epc']: name for name, cfg in tag_config.items()}
 
-    while len(records) < n_samples:
-        raw  = collector.read_buffer(0.3)
-        tags = parse_inventory_response(raw)
+    # Cek berapa tag yang sudah penuh
+    def all_done():
+        return all(len(records[n]) >= TARGET_SAMPLES for n in tag_config)
 
-        for tag in tags:
-            epc = tag['epc']
-            if not epc:
-                continue
+    def progress_str():
+        parts = [f"{n}:{len(records[n])}/{TARGET_SAMPLES}" for n in tag_config]
+        return "  |  ".join(parts)
 
-            if target_epc is None:
-                target_epc = epc
-                print(f"  [INFO] Tag terkunci — EPC: {epc}")
-                print(f"         RSSI pertama: {tag['rssi_dbm']:.1f} dBm "
-                      f"(raw: {tag['rssi_raw']})\n")
+    print(f"\n{'='*60}")
+    print(f"  Pengambilan data: {skenario} — {kondisi}")
+    print(f"  Tag terdaftar: {', '.join(tag_config.keys())}")
+    print(f"  Target: {TARGET_SAMPLES} sampel per tag")
+    print(f"{'='*60}")
+    print("  Pastikan SEMUA tag referensi sudah di posisinya.")
+    input("  Tekan ENTER untuk mulai...\n")
 
-            if epc == target_epc:
-                records.append({
-                    'epc'       : epc,
-                    'rssi_dbm'  : tag['rssi_dbm'],
-                    'timestamp' : datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                })
-                count = len(records)
-                if count % 50 == 0 or count == n_samples:
-                    rssi_vals = [r['rssi_dbm'] for r in records]
-                    avg = sum(rssi_vals) / len(rssi_vals)
-                    print(f"  [{count:>3}/{n_samples}]  avg RSSI: {avg:.1f} dBm")
+    reader.start()
+    last_print = time.time()
 
-            if len(records) >= n_samples:
-                break
+    try:
+        while not all_done():
+            raw  = reader.read_buffer(0.2)
+            tags = parse_inventory_response(raw)
 
-    collector.stop_inventory()
-    rssi_vals = [r['rssi_dbm'] for r in records]
-    print(f"\n  [SELESAI] {len(records)} sampel.")
-    print(f"  min={min(rssi_vals):.1f}  max={max(rssi_vals):.1f}  "
-          f"avg={sum(rssi_vals)/len(rssi_vals):.1f} dBm")
+            for t in tags:
+                epc  = t['epc']
+                name = epc_to_name.get(epc)
+
+                if name and len(records[name]) < TARGET_SAMPLES:
+                    records[name].append({
+                        'epc'       : epc,
+                        'rssi_dbm'  : t['rssi_dbm'],
+                        'timestamp' : datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    })
+
+            # Tampilkan progress setiap 2 detik
+            if time.time() - last_print >= 2.0:
+                print(f"  [{progress_str()}]")
+                last_print = time.time()
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Dihentikan pengguna.")
+
+    reader.stop()
+
+    # Ringkasan
+    print(f"\n  [SELESAI]")
+    for name, recs in records.items():
+        if recs:
+            rssi_vals = [r['rssi_dbm'] for r in recs]
+            print(f"  {name} ({tag_config[name]['jarak_cm']}cm): "
+                  f"{len(recs)} sampel  |  "
+                  f"avg={sum(rssi_vals)/len(rssi_vals):.1f}  "
+                  f"min={min(rssi_vals):.1f}  max={max(rssi_vals):.1f} dBm")
+
     return records
 
 
-# ─────────────────────────────────────────────
-#  SIMPAN KE EXCEL
-# ─────────────────────────────────────────────
-def save_to_excel(records, label, jarak_cm, kondisi, skenario):
+# ══════════════════════════════════════════════════════
+#  SIMPAN KE EXCEL — 1 file, sheet terpisah per tag
+# ══════════════════════════════════════════════════════
+
+def save_to_excel(records: dict, tag_config: dict,
+                  kondisi: str, skenario: str) -> str:
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"data_{skenario}_{kondisi}_{label}_{int(jarak_cm)}cm_{ts}.xlsx"
+    filename = f"data_{skenario}_{kondisi}_{ts}.xlsx"
+
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Data RSSI"
-    ws.append(["No", "Timestamp", "EPC", "RSSI (dBm)",
-               "Jarak Aktual (cm)", "Label Tag", "Kondisi", "Skenario"])
-    for i, r in enumerate(records, 1):
-        ws.append([i, r['timestamp'], r['epc'], r['rssi_dbm'],
-                   jarak_cm, label, kondisi, skenario])
-    for col in ws.columns:
-        w = max((len(str(c.value or '')) for c in col), default=0)
-        ws.column_dimensions[col[0].column_letter].width = min(w + 4, 40)
+    wb.remove(wb.active)  # Hapus sheet default
+
+    for name, recs in records.items():
+        if not recs:
+            continue
+        ws = wb.create_sheet(title=name)
+        jarak = tag_config[name]['jarak_cm']
+
+        ws.append(["No", "Timestamp", "EPC", "RSSI (dBm)",
+                   "Jarak Aktual (cm)", "Label Tag", "Kondisi", "Skenario"])
+        for i, r in enumerate(recs, 1):
+            ws.append([i, r['timestamp'], r['epc'], r['rssi_dbm'],
+                       jarak, name, kondisi, skenario])
+
+        # Auto-width
+        for col in ws.columns:
+            w = max((len(str(c.value or '')) for c in col), default=0)
+            ws.column_dimensions[col[0].column_letter].width = min(w + 4, 40)
+
+    # Sheet ringkasan
+    ws_sum = wb.create_sheet(title="Ringkasan", index=0)
+    ws_sum.append(["Tag", "Jarak (cm)", "Jumlah Sampel",
+                   "RSSI Avg (dBm)", "RSSI Min (dBm)", "RSSI Max (dBm)",
+                   "Kondisi", "Skenario"])
+    for name, recs in records.items():
+        if recs:
+            rssi_vals = [r['rssi_dbm'] for r in recs]
+            ws_sum.append([
+                name,
+                tag_config[name]['jarak_cm'],
+                len(recs),
+                round(sum(rssi_vals)/len(rssi_vals), 2),
+                min(rssi_vals),
+                max(rssi_vals),
+                kondisi,
+                skenario
+            ])
+
     wb.save(filename)
-    print(f"[OK] Tersimpan: {filename}")
+    print(f"\n[OK] Tersimpan: {filename}")
+    print(f"     Sheet: Ringkasan + {', '.join(records.keys())}")
     return filename
 
 
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════
 #  MAIN
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════
+
 def main():
-    print("=" * 55)
+    print("=" * 60)
     print("  Program Pengambilan Data RSSI UHF-RFID")
     print("  Penelitian: SVR-LANDMARC Adaptif — Wiranto")
-    print("=" * 55)
-    print("\nMode:  1 = Pengambilan data  |  2 = Diagnostik (debug)")
+    print("=" * 60)
+
+    print("\nMode:")
+    print("  1 = Pengambilan data (semua tag bersamaan)")
+    print("  2 = Diagnostik (cari EPC tag & cek nilai RSSI)")
     mode = input("Pilihan (1/2): ").strip()
 
-    collector = RFIDCollector(PORT, BAUDRATE)
-    if not collector.connect():
-        print(f"Ubah variabel PORT di baris 30 script ini.")
+    reader = RFIDReader(PORT, BAUDRATE)
+    if not reader.connect():
+        print(f"\nUbah variabel PORT di baris 35 script ini.")
         return
-    collector.init_reader()
+    reader.init()
 
     if mode == "2":
-        run_diagnostic(collector)
-        collector.disconnect()
+        run_diagnostic(reader)
+        reader.disconnect()
         return
 
-    # Mode pengambilan data normal
-    skenario  = "Skenario" + input("\nSkenario (1=2ref / 2=3ref): ").strip()
+    # ── Mode pengambilan data ──────────────────────────
+    print("\nKonfigurasi sesi:")
+    skenario  = "Skenario" + input("  Skenario (1=2ref / 2=3ref): ").strip()
     kondisi_m = {'1':'LOS','2':'NLOS_Sedikit','3':'NLOS_Sedang','4':'NLOS_Banyak'}
-    print("Kondisi: 1=LOS  2=NLOS_Sedikit  3=NLOS_Sedang  4=NLOS_Banyak")
-    kondisi   = kondisi_m.get(input("Pilih (1-4): ").strip(), 'LOS')
-    tag_m     = {'1':'R1','2':'R2','3':'R3','4':'Target'}
-    print("Tag: 1=R1  2=R2  3=R3  4=Target")
-    label_tag = tag_m.get(input("Pilih (1-4): ").strip(), 'Tag')
-    jarak_cm  = float(input(f"Jarak aktual {label_tag} dari reader (cm): ").strip())
+    print("  Kondisi: 1=LOS  2=NLOS_Sedikit  3=NLOS_Sedang  4=NLOS_Banyak")
+    kondisi = kondisi_m.get(input("  Pilih kondisi (1-4): ").strip(), 'LOS')
 
-    records = []
+    # Filter TAG_CONFIG sesuai skenario
+    if "1" in skenario:
+        active_tags = {k: v for k, v in TAG_CONFIG.items() if k in ('R1', 'R2')}
+    else:
+        active_tags = TAG_CONFIG.copy()
+
+    print(f"\n  Tag aktif: {list(active_tags.keys())}")
+    for name, cfg in active_tags.items():
+        print(f"    {name}: jarak {cfg['jarak_cm']} cm | EPC: {cfg['epc']}")
+
+    confirm = input("\n  Sudah benar? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print("  Batalkan. Edit TAG_CONFIG di bagian atas script.")
+        reader.disconnect()
+        return
+
+    records = {}
     try:
-        records = collect_samples(collector, TARGET_SAMPLES,
-                                  label_tag, jarak_cm, kondisi, skenario)
-        save_to_excel(records, label_tag, jarak_cm, kondisi, skenario)
-        print("\n[SELESAI] Jalankan lagi untuk tag/posisi berikutnya.")
-    except KeyboardInterrupt:
-        print("\n[INFO] Dihentikan pengguna.")
+        records = collect_all_tags(reader, active_tags, kondisi, skenario)
+        save_to_excel(records, active_tags, kondisi, skenario)
+        print("\n[SELESAI] Jalankan lagi untuk sesi berikutnya.")
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
         if records:
-            save_to_excel(records, label_tag, jarak_cm, kondisi, skenario)
+            print("Menyimpan data yang sudah terkumpul...")
+            save_to_excel(records, active_tags, kondisi, skenario)
     finally:
-        collector.disconnect()
+        reader.disconnect()
 
 
 if __name__ == "__main__":
